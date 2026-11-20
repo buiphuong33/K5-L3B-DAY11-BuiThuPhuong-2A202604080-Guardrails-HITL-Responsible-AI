@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -27,6 +28,10 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+# Loại issue được coi là lộ secret hệ thống (khác PII khách hàng)
+SECRET_ISSUE_TYPES = {"api_key", "password", "db_host", "protected_secret"}
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -37,17 +42,32 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
+    response = response or ""
     redacted = response
 
-    # PII patterns to check
+    # Thứ tự quan trọng: email trước phone, password trước secret literal.
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        # Email
+        "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+        # API key kiểu sk-xxxx (OpenAI / VinBank demo)
+        "api_key": r"\bsk-[A-Za-z0-9_-]{6,}",
+        # password=..., password: ..., password is ..., mật khẩu là ...
+        # (bắt buộc có dấu nối để không redact câu "reset your password online")
+        "password": r"\b(?:password|passwd|pwd|mật khẩu|mat khau)(?:\s*[:=]\s*|\s+(?:is|là|la)\s+)\S+",
+        # Host nội bộ: db.vinbank.internal:5432
+        "db_host": r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d+)?\b",
+        # SĐT VN: 0 + 9..10 số, hoặc +84 + 9..10 số (không khớp hotline 1900 545 467)
+        # (lookaround: không dính chữ số liền kề, cũng không là một phần của
+        #  số tiền dạng 500.000.000 — nhưng vẫn bắt được số ở cuối câu "....345.")
+        "phone": r"(?<!\d)(?<!\d[.,])(?:\+84|0)\d{9,10}(?!\d)(?![.,]\d)",
+        # CCCD 12 số, hoặc CMND 9 số bắt đầu bằng 0 (tránh nhầm số tiền 500000000)
+        "national_id": r"(?<!\d)(?<!\d[.,])(?:\d{12}|0\d{8})(?!\d)(?![.,]\d)",
     }
+    # Giá trị secret cụ thể trong data/protected/vinbank_secrets.json — chặn nguyên văn
+    if DEMO_SECRETS:
+        PII_PATTERNS["protected_secret"] = "|".join(
+            re.escape(s) for s in sorted(DEMO_SECRETS, key=len, reverse=True)
+        )
 
     for name, pattern in PII_PATTERNS.items():
         matches = re.findall(pattern, response, re.IGNORECASE)
@@ -172,16 +192,46 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Regex filter
+        #    - Lộ SECRET hệ thống (password / API key / DB host) -> giữ lại cả câu
+        #      trả lời (blocked): phần còn lại có thể vẫn gợi ý secret.
+        #    - Chỉ PII thường (email, SĐT, CCCD) -> che bằng [REDACTED].
+        result = content_filter(response_text)
+        issue_types = {i.split(":", 1)[0] for i in result["issues"]}
+        if issue_types & SECRET_ISSUE_TYPES:
+            self.blocked_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(
+                    text="Response withheld by output guardrail: it contained internal "
+                         "system information. I can help with banking questions only."
+                )],
+            )
+            return llm_response
+        if not result["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=result["redacted"])],
+            )
+            response_text = result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        # 2. (Optional) LLM-as-Judge — chỉ chạy khi đã khởi tạo judge
+        if self.use_llm_judge:
+            judge = await llm_safety_check(response_text)
+            if not judge["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="Response withheld by output guardrail: it may contain "
+                             "unsafe or inaccurate information. Please contact VinBank "
+                             "support at 1900 545 467."
+                    )],
+                )
+
+        # 3. Trả response (có thể đã bị sửa)
+        return llm_response
 
 
 # ============================================================
